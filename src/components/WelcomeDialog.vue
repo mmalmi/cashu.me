@@ -23,13 +23,6 @@
       <q-card-section>
         <p>Please take a moment to read the following information.</p>
         <p>
-          <strong>Install and add to home screen.</strong>
-          For the best experience, use this wallet with your device's native web
-          browser (Safari on iOS, Chrome on Android). In Chrome click the
-          hamburger menu at the upper right. In Safari click the share button
-          and press the Add to Home screen button.
-        </p>
-        <p>
           <strong>Back up your seed phrase.</strong> This wallet stores ecash
           tokens in its database. If you delete your browser data without
           backing up, you will lose your tokens. Make sure to back up your
