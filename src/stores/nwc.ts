@@ -66,7 +66,7 @@ const NWCKind = {
 
 export const useNWCStore = defineStore("nwc", {
   state: () => ({
-    nwcEnabled: useLocalStorage<boolean>("cashu.nwc.enabled", false),
+    nwcEnabled: useLocalStorage<boolean>("cashu.nwc.enabled", true),
     connections: useLocalStorage<NWCConnection[]>("cashu.nwc.connections", []),
     seenCommandsUntil: useLocalStorage<number>(
       "cashu.nwc.seenCommandsUntil",
@@ -424,7 +424,7 @@ export const useNWCStore = defineStore("nwc", {
           walletPrivateKey: walletPrivateKeyHex,
           connectionSecret: connectionSecretHex,
           connectionPublicKey: connectionPublicKeyHex,
-          allowanceLeft: 1000,
+          allowanceLeft: 10000,
         } as NWCConnection;
         this.connections = this.connections.concat(conn);
       } else {
