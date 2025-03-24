@@ -426,6 +426,15 @@ export const useNWCStore = defineStore("nwc", {
           allowanceLeft: 10000,
         } as NWCConnection;
         this.connections = this.connections.concat(conn);
+        // Save NWC connection string to localStorage for Iris Nostr Wallet Connect
+        const nwcUrl = this.getConnectionString(conn);
+        const bcConfig = {
+          nwcUrl: nwcUrl,
+          connectorName: "Nostr Wallet Connect",
+          connectorType: "nwc.generic",
+        };
+        localStorage.setItem("bc:config", JSON.stringify(bcConfig));
+        return conn;
       } else {
         conn = this.connections[0];
       }
