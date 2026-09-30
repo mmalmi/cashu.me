@@ -640,7 +640,11 @@ export default {
     // generate new mnemonic
     this.initializeMnemonic();
 
-    this.initSigner();
+    // Saved funds remain available while a remote signer is offline. Explicit
+    // signing actions still await initialization and surface their own failure.
+    this.initSigner().catch((error) => {
+      console.debug("Saved signer unavailable during wallet startup", error);
+    });
 
     // show welcome dialog
     this.showWelcomePage();
