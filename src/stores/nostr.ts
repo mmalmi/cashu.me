@@ -1,23 +1,26 @@
 import { defineStore } from "pinia";
-import NDK, {
-  NDKEvent,
-  NDKSigner,
-  NDKNip07Signer,
-  NDKNip46Signer,
-  NDKFilter,
-  NDKPrivateKeySigner,
-  NostrEvent,
-  NDKKind,
-  NDKRelaySet,
-  NDKRelay,
-  NDKTag,
-  ProfilePointer,
-} from "@nostr-dev-kit/ndk";
-import { nip04, nip19, nip44 } from "nostr-tools";
-import { bytesToHex, hexToBytes } from "@noble/hashes/utils"; // already an installed dependency
-import { useWalletStore } from "./wallet";
-import { generateSecretKey, getPublicKey } from "nostr-tools";
+import { markRaw } from "vue";
 import { useLocalStorage } from "@vueuse/core";
+import { bytesToHex, hexToBytes } from "@noble/hashes/utils";
+import {
+  generateSecretKey,
+  getEventHash,
+  getPublicKey,
+  nip04,
+  nip19,
+  nip44,
+  verifyEvent,
+} from "nostr-tools";
+import type { EventTemplate } from "nostr-tools";
+import type { RuntimeSubscription } from "nostr-pubsub";
+import { nostrRuntime, publishEvent } from "src/js/nostrRuntime";
+import {
+  extensionSigner,
+  privateSigner,
+  remoteSigner,
+} from "src/js/nostrSigner";
+import type { WalletSigner } from "src/js/nostrSigner";
+import { useWalletStore } from "./wallet";
 import { useSettingsStore } from "./settings";
 import { useReceiveTokensStore } from "./receiveTokensStore";
 import {
@@ -26,27 +29,13 @@ import {
   Token,
 } from "@cashu/cashu-ts";
 import { useTokensStore } from "./tokens";
-import {
-  notifyApiError,
-  notifyError,
-  notifySuccess,
-  notifyWarning,
-  notify,
-} from "../js/notify";
+import { notifyError, notifySuccess, notifyWarning } from "../js/notify";
 import { useSendTokensStore } from "./sendTokensStore";
 import { usePRStore } from "./payment-request";
 import token from "../js/token";
-import { HistoryToken } from "./tokens";
 
-type MintRecommendation = {
-  url: string;
-  count: number;
-};
-
-type NostrEventLog = {
-  id: string;
-  created_at: number;
-};
+type MintRecommendation = { url: string; count: number };
+type NostrEventLog = { id: string; created_at: number };
 
 export enum SignerType {
   NIP07 = "NIP07",
@@ -55,21 +44,20 @@ export enum SignerType {
   SEED = "SEED",
 }
 
+let initializing: Promise<void> | undefined;
+const subscriptions = new Map<number, RuntimeSubscription>();
+
 export const useNostrStore = defineStore("nostr", {
   state: () => ({
-    connected: false,
     pubkey: useLocalStorage<string>("cashu.ndk.pubkey", ""),
     relays: useSettingsStore().defaultNostrRelays,
-    ndk: {} as NDK,
     signerType: useLocalStorage<SignerType>(
       "cashu.ndk.signerType",
       localStorage.getItem("cashu.ndk.privateKeySignerPrivateKey")
         ? SignerType.PRIVATEKEY
         : SignerType.NIP07
     ),
-    nip07signer: {} as NDKNip07Signer,
     nip46Token: useLocalStorage<string>("cashu.ndk.nip46Token", ""),
-    nip46signer: {} as NDKNip46Signer,
     privateKeySignerPrivateKey: useLocalStorage<string>(
       "cashu.ndk.privateKeySignerPrivateKey",
       ""
@@ -82,10 +70,7 @@ export const useNostrStore = defineStore("nostr", {
       "cashu.ndk.seedSignerPublicKey",
       ""
     ),
-    seedSigner: {} as NDKPrivateKeySigner,
-    seedSignerPrivateKeyNsec: "",
-    privateKeySigner: {} as NDKPrivateKeySigner,
-    signer: {} as NDKSigner,
+    signer: null as WalletSigner | null,
     mintRecommendations: useLocalStorage<MintRecommendation[]>(
       "cashu.ndk.mintRecommendations",
       []
@@ -101,277 +86,196 @@ export const useNostrStore = defineStore("nostr", {
     ),
   }),
   getters: {
-    seedSignerPrivateKeyNsec: (state) => {
-      const sk = hexToBytes(state.seedSignerPrivateKey);
-      return nip19.nsecEncode(sk);
-    },
-    nprofile: (state) => {
-      const profile: ProfilePointer = {
-        pubkey: state.pubkey,
-        relays: state.relays,
-      };
-      return nip19.nprofileEncode(profile);
-    },
-    seedSignerNprofile: (state) => {
-      const profile: ProfilePointer = {
+    seedSignerPrivateKeyNsec: (state) =>
+      state.seedSignerPrivateKey
+        ? nip19.nsecEncode(hexToBytes(state.seedSignerPrivateKey))
+        : "",
+    nprofile: (state) =>
+      nip19.nprofileEncode({ pubkey: state.pubkey, relays: state.relays }),
+    seedSignerNprofile: (state) =>
+      nip19.nprofileEncode({
         pubkey: state.seedSignerPublicKey,
         relays: state.relays,
-      };
-      return nip19.nprofileEncode(profile);
-    },
+      }),
   },
   actions: {
-    initNdkReadOnly: function () {
-      this.ndk = new NDK({ explicitRelayUrls: this.relays });
-      this.ndk.connect();
-      this.connected = true;
-    },
     initSignerIfNotSet: async function () {
-      if (!this.initialized) {
-        await this.initSigner();
-      }
+      if (!this.initialized) await this.initSigner();
     },
     initSigner: async function () {
-      if (this.signerType === SignerType.NIP07) {
-        await this.initNip07Signer();
-      } else if (this.signerType === SignerType.NIP46) {
-        await this.initNip46Signer();
-      } else if (this.signerType === SignerType.PRIVATEKEY) {
-        await this.initPrivateKeySigner();
-      } else {
-        await this.initWalletSeedPrivateKeySigner();
+      if (!initializing) {
+        initializing = (async () => {
+          if (this.signerType === SignerType.NIP07)
+            await this.initNip07Signer();
+          else if (this.signerType === SignerType.NIP46)
+            await this.initNip46Signer();
+          else if (this.signerType === SignerType.PRIVATEKEY)
+            await this.initPrivateKeySigner();
+          else await this.initWalletSeedPrivateKeySigner();
+        })().finally(() => {
+          initializing = undefined;
+        });
       }
+      await initializing;
+    },
+    setSigner: function (signer: WalletSigner, type: SignerType) {
+      this.signer?.close?.();
+      this.signer = markRaw(signer);
+      this.pubkey = signer.pubkey;
+      this.signerType = type;
       this.initialized = true;
     },
-    setSigner: async function (signer: NDKSigner) {
-      this.signer = signer;
-      this.ndk = new NDK({ signer: signer, explicitRelayUrls: this.relays });
-    },
-    signDummyEvent: async function (): Promise<NDKEvent> {
-      const ndkEvent = new NDKEvent();
-      ndkEvent.kind = 1;
-      ndkEvent.content = "Hello, world!";
-      const sig = await ndkEvent.sign(this.signer);
-      console.log(`nostr signature: ${sig})`);
-      const eventString = JSON.stringify(ndkEvent.rawEvent());
-      console.log(`nostr event: ${eventString}`);
-      return ndkEvent;
-    },
-    setPubkey: function (pubkey: string) {
-      console.log("Setting pubkey to", pubkey);
-      this.pubkey = pubkey;
+    signEvent: async function (event: EventTemplate) {
+      await this.initSignerIfNotSet();
+      if (!this.signer) throw new Error("Connect a signer first");
+      return this.signer.signEvent(event);
     },
     checkNip07Signer: async function (): Promise<boolean> {
-      const signer = new NDKNip07Signer();
       try {
-        await signer.user();
-        return true;
-      } catch (e) {
+        return Boolean(await extensionSigner());
+      } catch {
         return false;
       }
     },
     initNip07Signer: async function () {
-      const signer = new NDKNip07Signer();
-      signer.user().then(async (user) => {
-        if (!!user.npub) {
-          console.log(
-            "Permission granted to read their public key:",
-            user.npub
-          );
-          const me = this.ndk.getUser({
-            npub: user.npub,
-          });
-          this.signerType = SignerType.NIP07;
-          await this.setSigner(signer);
-          this.setPubkey(user.pubkey);
-        }
-      });
-      await signer.blockUntilReady();
+      const signer = await extensionSigner();
+      if (signer) this.setSigner(signer, SignerType.NIP07);
     },
     initNip46Signer: async function (nip46Token?: string) {
-      const ndk = new NDK({ explicitRelayUrls: this.relays });
-      if (!nip46Token && !this.nip46Token.length) {
-        nip46Token = (await prompt(
-          "Enter your NIP-46 connection string"
-        )) as string;
-        if (!nip46Token) {
-          return;
-        }
-        this.nip46Token = nip46Token;
-      } else {
-        if (nip46Token) {
-          this.nip46Token = nip46Token;
-        }
-      }
-      const signer = new NDKNip46Signer(ndk, this.nip46Token);
-      this.signerType = SignerType.NIP46;
-      await this.setSigner(signer);
-      // If the backend sends an auth_url event, open that URL as a popup so the user can authorize the app
-      signer.on("authUrl", (url) => {
-        window.open(url, "auth", "width=600,height=600");
-      });
-      // wait until the signer is ready
-      const loggedinUser = await signer.blockUntilReady();
-      alert("You are now logged in as " + loggedinUser.npub);
-      this.setPubkey(loggedinUser.pubkey);
+      const token =
+        nip46Token ||
+        this.nip46Token ||
+        prompt("Enter your remote signer connection string");
+      if (!token) return;
+      const signer = await remoteSigner(token, this.relays, (url) =>
+        window.open(url, "auth", "width=600,height=600")
+      );
+      this.nip46Token = token;
+      this.setSigner(signer, SignerType.NIP46);
     },
     resetNip46Signer: async function () {
       this.nip46Token = "";
       await this.initWalletSeedPrivateKeySigner();
     },
     initPrivateKeySigner: async function (nsec?: string) {
-      let privateKeyBytes: Uint8Array;
-      if (!nsec && !this.privateKeySignerPrivateKey.length) {
-        nsec = (await prompt("Enter your nsec")) as string;
-        if (!nsec) {
-          return;
-        }
-        privateKeyBytes = nip19.decode(nsec).data as Uint8Array;
+      if (!nsec && !this.privateKeySignerPrivateKey)
+        nsec = prompt("Enter your secret key") || undefined;
+      let key: Uint8Array;
+      if (nsec) {
+        const decoded = nip19.decode(nsec);
+        if (decoded.type !== "nsec") throw new Error("Invalid secret key");
+        key = decoded.data;
       } else {
-        if (nsec) {
-          privateKeyBytes = nip19.decode(nsec).data as Uint8Array;
-        } else {
-          privateKeyBytes = hexToBytes(this.privateKeySignerPrivateKey);
-        }
+        if (!this.privateKeySignerPrivateKey) return;
+        key = hexToBytes(this.privateKeySignerPrivateKey);
       }
-      this.privateKeySigner = new NDKPrivateKeySigner(
-        this.privateKeySignerPrivateKey
-      );
-      this.privateKeySignerPrivateKey = bytesToHex(privateKeyBytes);
-      this.signerType = SignerType.PRIVATEKEY;
-      await this.setSigner(this.privateKeySigner);
-      const publicKeyHex = getPublicKey(privateKeyBytes);
-      this.setPubkey(publicKeyHex);
+      const signer = privateSigner(key);
+      this.privateKeySignerPrivateKey = bytesToHex(key);
+      this.setSigner(signer, SignerType.PRIVATEKEY);
     },
     resetPrivateKeySigner: async function () {
       this.privateKeySignerPrivateKey = "";
       await this.initWalletSeedPrivateKeySigner();
     },
     walletSeedGenerateKeyPair: async function () {
-      const walletStore = useWalletStore();
-      const sk = walletStore.seed.slice(0, 32);
-      const walletPublicKeyHex = getPublicKey(sk); // `pk` is a hex string
-      const walletPrivateKeyHex = bytesToHex(sk);
-      this.seedSignerPrivateKey = walletPrivateKeyHex;
-      this.seedSignerPublicKey = walletPublicKeyHex;
-      this.seedSigner = new NDKPrivateKeySigner(this.seedSignerPrivateKey);
+      const key = useWalletStore().seed.slice(0, 32);
+      this.seedSignerPrivateKey = bytesToHex(key);
+      this.seedSignerPublicKey = getPublicKey(key);
     },
     initWalletSeedPrivateKeySigner: async function () {
       await this.walletSeedGenerateKeyPair();
-      // TODO: remove duplicate privateKeysigner
-      this.privateKeySigner = this.seedSigner;
-      this.signerType = SignerType.SEED;
-      this.setSigner(this.privateKeySigner);
-      this.setPubkey(this.seedSignerPublicKey);
+      this.setSigner(privateSigner(this.seedSignerPrivateKey), SignerType.SEED);
     },
     fetchEventsFromUser: async function () {
-      const filter: NDKFilter = { kinds: [1], authors: [this.pubkey] };
-      return await this.ndk.fetchEvents(filter);
+      const result = await nostrRuntime.query(
+        [{ kinds: [1], authors: [this.pubkey] }],
+        { relays: this.relays }
+      );
+      return new Set(result.events);
     },
     fetchMints: async function () {
-      const filter: NDKFilter = { kinds: [38000 as NDKKind], limit: 2000 };
-      const events = await this.ndk.fetchEvents(filter);
-      let mintUrls: string[] = [];
-      events.forEach((event) => {
-        if (event.tagValue("k") == "38172" && event.tagValue("u")) {
-          const mintUrl = event.tagValue("u");
-          if (
-            typeof mintUrl === "string" &&
-            mintUrl.length > 0 &&
-            mintUrl.startsWith("https://")
-          ) {
-            mintUrls.push(mintUrl);
-          }
-        }
-      });
-      // Count the number of times each mint URL appears
-      const mintUrlsSet = new Set(mintUrls);
-      const mintUrlsArray = Array.from(mintUrlsSet);
-      const mintUrlsCounted = mintUrlsArray.map((url) => {
-        return { url: url, count: mintUrls.filter((u) => u === url).length };
-      });
-      mintUrlsCounted.sort((a, b) => b.count - a.count);
-      this.mintRecommendations = mintUrlsCounted;
-      return mintUrlsCounted;
+      const { events } = await nostrRuntime.query(
+        [{ kinds: [38000], limit: 2000 }],
+        { relays: this.relays }
+      );
+      const counts = new Map<string, number>();
+      for (const event of events) {
+        const url = event.tags.find((tag: string[]) => tag[0] === "u")?.[1];
+        if (
+          event.tags.find((tag: string[]) => tag[0] === "k")?.[1] === "38172" &&
+          url?.startsWith("https://")
+        )
+          counts.set(url, (counts.get(url) || 0) + 1);
+      }
+      this.mintRecommendations = Array.from(counts, ([url, count]) => ({
+        url,
+        count,
+      })).sort((a, b) => b.count - a.count);
+      return this.mintRecommendations;
     },
     sendNip04DirectMessage: async function (
       recipient: string,
       message: string
     ) {
-      const randomPrivateKey = generateSecretKey();
-      const randomPublicKey = getPublicKey(randomPrivateKey);
-      // const randomPrivateKey = hexToBytes(this.seedSignerPrivateKey);
-      // const randomPublicKey = this.pubkey;
-      const ndk = new NDK({
-        explicitRelayUrls: this.relays,
-        signer: new NDKPrivateKeySigner(bytesToHex(randomPrivateKey)),
-      });
-      const event = new NDKEvent(ndk);
-      ndk.connect();
-      event.kind = NDKKind.EncryptedDirectMessage;
-      event.content = await nip04.encrypt(randomPrivateKey, recipient, message);
-      event.tags = [["p", recipient]];
-      event.sign();
+      const key = generateSecretKey();
       try {
-        await event.publish();
+        await publishEvent(
+          await privateSigner(key).signEvent({
+            kind: 4,
+            created_at: Math.floor(Date.now() / 1000),
+            tags: [["p", recipient]],
+            content: await nip04.encrypt(key, recipient, message),
+          }),
+          this.relays
+        );
         notifySuccess("NIP-04 event published");
-      } catch (e) {
-        console.error(e);
+      } catch {
         notifyError("Could not publish NIP-04 event");
       }
     },
     subscribeToNip04DirectMessages: async function () {
       await this.walletSeedGenerateKeyPair();
-      await this.initNdkReadOnly();
-      let nip04DirectMessageEvents: Set<NDKEvent> = new Set();
-      const fetchEventsPromise = new Promise<Set<NDKEvent>>((resolve) => {
-        if (!this.lastEventTimestamp) {
-          this.lastEventTimestamp = Math.floor(Date.now() / 1000);
-        }
-        console.log(
-          `### Subscribing to NIP-04 direct messages to ${this.seedSignerPublicKey} since ${this.lastEventTimestamp}`
-        );
-        this.ndk.connect();
-        const sub = this.ndk.subscribe(
+      if (!this.lastEventTimestamp)
+        this.lastEventTimestamp = Math.floor(Date.now() / 1000);
+      subscriptions.get(4)?.close();
+      subscriptions.set(
+        4,
+        nostrRuntime.subscribe(
+          [
+            {
+              kinds: [4],
+              "#p": [this.seedSignerPublicKey],
+              since: this.lastEventTimestamp,
+            },
+          ],
           {
-            kinds: [NDKKind.EncryptedDirectMessage],
-            "#p": [this.seedSignerPublicKey],
-            since: this.lastEventTimestamp,
-          } as NDKFilter,
-          { closeOnEose: false, groupable: false }
-        );
-        sub.on("event", (event: NDKEvent) => {
-          console.log("event");
-          nip04
-            .decrypt(
-              hexToBytes(this.seedSignerPrivateKey),
-              event.pubkey,
-              event.content
-            )
-            .then((content) => {
-              console.log("NIP-04 DM from", event.pubkey);
-              console.log("Content:", content);
-              nip04DirectMessageEvents.add(event);
-              this.lastEventTimestamp = Math.floor(Date.now() / 1000);
-              this.parseMessageForEcash(content);
-            });
-        });
-      });
-      try {
-        nip04DirectMessageEvents = await fetchEventsPromise;
-      } catch (error) {
-        console.error("Error fetching contact events:", error);
-      }
+            onEvent: (event) => {
+              void (async () => {
+                const content = await nip04.decrypt(
+                  hexToBytes(this.seedSignerPrivateKey),
+                  event.pubkey,
+                  event.content
+                );
+                this.lastEventTimestamp = Math.floor(Date.now() / 1000);
+                await this.parseMessageForEcash(content);
+              })().catch(() => undefined);
+            },
+          },
+          { relays: this.relays, cache: "network-only", localEcho: false }
+        )
+      );
     },
     sendNip17DirectMessageToNprofile: async function (
       nprofile: string,
       message: string
     ) {
       const result = nip19.decode(nprofile);
-      const pubkey: string = (result.data as ProfilePointer).pubkey;
-      const relays: string[] | undefined = (result.data as ProfilePointer)
-        .relays;
-      this.sendNip17DirectMessage(pubkey, message, relays);
+      if (result.type !== "nprofile") throw new Error("Invalid recipient");
+      await this.sendNip17DirectMessage(
+        result.data.pubkey,
+        message,
+        result.data.relays
+      );
     },
     randomTimeUpTo2DaysInThePast: function () {
       return Math.floor(Date.now() / 1000) - Math.floor(Math.random() * 172800);
@@ -382,137 +286,109 @@ export const useNostrStore = defineStore("nostr", {
       relays?: string[]
     ) {
       await this.walletSeedGenerateKeyPair();
-      const randomPrivateKey = generateSecretKey();
-      const randomPublicKey = getPublicKey(randomPrivateKey);
-
-      const dmEvent = new NDKEvent();
-      dmEvent.kind = 14;
-      dmEvent.content = message;
-      dmEvent.tags = [["p", recipient]];
-      dmEvent.created_at = Math.floor(Date.now() / 1000);
-      dmEvent.pubkey = this.seedSignerPublicKey;
-      dmEvent.id = dmEvent.getEventHash();
-      const dmEventString = JSON.stringify(await dmEvent.toNostrEvent());
-
-      const seedNdk = new NDK({
-        signer: this.seedSigner,
-        explicitRelayUrls: this.relays,
+      const key = hexToBytes(this.seedSignerPrivateKey),
+        randomKey = generateSecretKey();
+      const rumor = {
+        kind: 14,
+        pubkey: this.seedSignerPublicKey,
+        created_at: Math.floor(Date.now() / 1000),
+        tags: [["p", recipient]],
+        content: message,
+      };
+      const seal = await privateSigner(key).signEvent({
+        kind: 13,
+        created_at: this.randomTimeUpTo2DaysInThePast(),
+        tags: [],
+        content: nip44.v2.encrypt(
+          JSON.stringify({ ...rumor, id: getEventHash(rumor) }),
+          nip44.v2.utils.getConversationKey(key, recipient)
+        ),
       });
-      const sealEvent = new NDKEvent(seedNdk);
-      sealEvent.kind = 13;
-      sealEvent.content = nip44.v2.encrypt(
-        dmEventString,
-        nip44.v2.utils.getConversationKey(this.seedSignerPrivateKey, recipient)
-      );
-      sealEvent.created_at = this.randomTimeUpTo2DaysInThePast();
-      sealEvent.pubkey = this.seedSignerPublicKey;
-      sealEvent.id = sealEvent.getEventHash();
-      sealEvent.sig = await sealEvent.sign();
-      const sealEventString = JSON.stringify(await sealEvent.toNostrEvent());
-
-      const randomNdk = new NDK({
-        explicitRelayUrls: relays ?? this.relays,
-        signer: new NDKPrivateKeySigner(bytesToHex(randomPrivateKey)),
+      const wrap = await privateSigner(randomKey).signEvent({
+        kind: 1059,
+        created_at: this.randomTimeUpTo2DaysInThePast(),
+        tags: [["p", recipient]],
+        content: nip44.v2.encrypt(
+          JSON.stringify(seal),
+          nip44.v2.utils.getConversationKey(randomKey, recipient)
+        ),
       });
-      const wrapEvent = new NDKEvent(randomNdk);
-      wrapEvent.kind = 1059;
-      wrapEvent.tags = [["p", recipient]];
-      wrapEvent.content = nip44.v2.encrypt(
-        sealEventString,
-        nip44.v2.utils.getConversationKey(
-          bytesToHex(randomPrivateKey),
-          recipient
-        )
-      );
-      wrapEvent.created_at = this.randomTimeUpTo2DaysInThePast();
-      wrapEvent.pubkey = randomPublicKey;
-      wrapEvent.id = wrapEvent.getEventHash();
-      wrapEvent.sig = await wrapEvent.sign();
-
       try {
-        randomNdk.connect();
-        await wrapEvent.publish();
-      } catch (e) {
-        console.error(e);
+        await publishEvent(wrap, relays ?? this.relays);
+      } catch {
         notifyError("Could not publish NIP-17 event");
       }
     },
     subscribeToNip17DirectMessages: async function () {
       await this.walletSeedGenerateKeyPair();
-      await this.initNdkReadOnly();
-      let nip17DirectMessageEvents: Set<NDKEvent> = new Set();
-      const fetchEventsPromise = new Promise<Set<NDKEvent>>((resolve) => {
-        if (!this.lastEventTimestamp) {
-          this.lastEventTimestamp = Math.floor(Date.now() / 1000);
-        }
-        const since = this.lastEventTimestamp - 172800; // last 2 days
-        console.log(
-          `### Subscribing to NIP-17 direct messages to ${this.seedSignerPublicKey} since ${since}`
-        );
-        this.ndk.connect();
-        const sub = this.ndk.subscribe(
+      if (!this.lastEventTimestamp)
+        this.lastEventTimestamp = Math.floor(Date.now() / 1000);
+      subscriptions.get(1059)?.close();
+      subscriptions.set(
+        1059,
+        nostrRuntime.subscribe(
+          [
+            {
+              kinds: [1059],
+              "#p": [this.seedSignerPublicKey],
+              since: this.lastEventTimestamp - 172800,
+            },
+          ],
           {
-            kinds: [1059 as NDKKind],
-            "#p": [this.seedSignerPublicKey],
-            since: since,
-          } as NDKFilter,
-          { closeOnEose: false, groupable: false }
-        );
-
-        sub.on("event", (wrapEvent: NDKEvent) => {
-          const eventLog = {
-            id: wrapEvent.id,
-            created_at: wrapEvent.created_at,
-          } as NostrEventLog;
-          if (this.nip17EventIdsWeHaveSeen.find((e) => e.id === wrapEvent.id)) {
-            // console.log(`### Already seen NIP-17 event ${wrapEvent.id} (time: ${wrapEvent.created_at})`);
-            return;
-          } else {
-            console.log(`### New event ${wrapEvent.id}`);
-            this.nip17EventIdsWeHaveSeen.push(eventLog);
-            // remove all events older than 10 days to keep the list small
-            const fourDaysAgo =
-              Math.floor(Date.now() / 1000) - 10 * 24 * 60 * 60;
-            this.nip17EventIdsWeHaveSeen = this.nip17EventIdsWeHaveSeen.filter(
-              (e) => e.created_at > fourDaysAgo
-            );
-          }
-          let dmEvent: NDKEvent;
-          let content: string;
-          try {
-            const wappedContent = nip44.v2.decrypt(
-              wrapEvent.content,
-              nip44.v2.utils.getConversationKey(
-                this.seedSignerPrivateKey,
-                wrapEvent.pubkey
+            onEvent: (wrap) => {
+              if (
+                this.nip17EventIdsWeHaveSeen.some(
+                  (event) => event.id === wrap.id
+                )
               )
-            );
-            const sealEvent = JSON.parse(wappedContent) as NostrEvent;
-            const dmEventString = nip44.v2.decrypt(
-              sealEvent.content,
-              nip44.v2.utils.getConversationKey(
-                this.seedSignerPrivateKey,
-                sealEvent.pubkey
-              )
-            );
-            dmEvent = JSON.parse(dmEventString) as NDKEvent;
-            content = dmEvent.content;
-            console.log("### NIP-17 DM from", dmEvent.pubkey);
-            console.log("Content:", content);
-          } catch (e) {
-            console.error(e);
-            return;
-          }
-          nip17DirectMessageEvents.add(dmEvent);
-          this.lastEventTimestamp = Math.floor(Date.now() / 1000);
-          this.parseMessageForEcash(content);
-        });
-      });
-      try {
-        nip17DirectMessageEvents = await fetchEventsPromise;
-      } catch (error) {
-        console.error("Error fetching contact events:", error);
-      }
+                return;
+              try {
+                const key = hexToBytes(this.seedSignerPrivateKey);
+                const seal = JSON.parse(
+                  nip44.v2.decrypt(
+                    wrap.content,
+                    nip44.v2.utils.getConversationKey(key, wrap.pubkey)
+                  )
+                );
+                if (seal.kind !== 13 || !verifyEvent(seal)) return;
+                const rumor = JSON.parse(
+                  nip44.v2.decrypt(
+                    seal.content,
+                    nip44.v2.utils.getConversationKey(key, seal.pubkey)
+                  )
+                );
+                if (
+                  rumor.kind !== 14 ||
+                  rumor.pubkey !== seal.pubkey ||
+                  rumor.id !== getEventHash(rumor) ||
+                  !rumor.tags.some(
+                    (tag: string[]) =>
+                      tag[0] === "p" && tag[1] === this.seedSignerPublicKey
+                  )
+                )
+                  return;
+                this.nip17EventIdsWeHaveSeen.push({
+                  id: wrap.id,
+                  created_at: wrap.created_at,
+                });
+                const cutoff =
+                  Math.floor(Date.now() / 1000) - 10 * 24 * 60 * 60;
+                this.nip17EventIdsWeHaveSeen =
+                  this.nip17EventIdsWeHaveSeen.filter(
+                    (event) => event.created_at > cutoff
+                  );
+                this.lastEventTimestamp = Math.floor(Date.now() / 1000);
+                void this.parseMessageForEcash(rumor.content).catch(
+                  () => undefined
+                );
+              } catch {
+                /* Ignore malformed or undecryptable messages. */
+              }
+            },
+          },
+          { relays: this.relays, cache: "network-only", localEcho: false }
+        )
+      );
     },
     parseMessageForEcash: async function (message: string) {
       // first check if the message can be converted to a json and then to a PaymentRequestPayload

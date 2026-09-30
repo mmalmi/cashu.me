@@ -1,5 +1,4 @@
 import { defineStore } from "pinia";
-import NDK, { NDKEvent, NDKPrivateKeySigner } from "@nostr-dev-kit/ndk";
 import { useLocalStorage } from "@vueuse/core";
 import { bytesToHex } from "@noble/hashes/utils"; // already an installed dependency
 import { generateSecretKey, getPublicKey } from "nostr-tools";
@@ -68,8 +67,6 @@ export const useNPCStore = defineStore("npc", {
     npcDomain: useLocalStorage<string>("cashu.npc.domain", "npub.cash"),
     baseURL: useLocalStorage<string>("cashu.npc.baseURL", "https://npub.cash"),
     npcLoading: false,
-    // ndk: new NDK(),
-    // signer: {} as NDKPrivateKeySigner,
   }),
   getters: {},
   actions: {
@@ -121,18 +118,17 @@ export const useNPCStore = defineStore("npc", {
     ): Promise<string> {
       const nostrStore = useNostrStore();
       await nostrStore.initSignerIfNotSet();
-      const nip98Event = new NDKEvent(new NDK());
-      nip98Event.kind = NIP98Kind;
-      nip98Event.content = "";
-      nip98Event.tags = [
-        ["u", url],
-        ["method", method],
-      ];
+      const event = await nostrStore.signEvent({
+        kind: NIP98Kind,
+        created_at: Math.floor(Date.now() / 1000),
+        content: "",
+        tags: [
+          ["u", url],
+          ["method", method],
+        ],
+      });
       // TODO: if body is set, add 'payload' tag with sha256 hash of body
-      const sig = await nip98Event.sign(nostrStore.signer);
-      const eventString = JSON.stringify(nip98Event.rawEvent());
-      // encode the eventString to base64
-      return btoa(eventString);
+      return btoa(JSON.stringify(event));
     },
     getInfo: async function (): Promise<NPCInfo> {
       const authHeader = await this.generateNip98Event(

@@ -542,7 +542,6 @@ export default defineComponent({
   methods: {
     ...mapActions(useNostrStore, [
       "init",
-      "initNdkReadOnly",
       "getUserPubkey",
       "fetchEventsFromUser",
       "fetchMints",
@@ -634,7 +633,6 @@ export default defineComponent({
     },
     fetchMintsFromNdk: async function () {
       this.discoveringMints = true;
-      await this.initNdkReadOnly();
       console.log("### fetch mints");
       let maxTries = 5;
       let tries = 0;

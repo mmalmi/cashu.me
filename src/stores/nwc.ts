@@ -1,13 +1,8 @@
 import { defineStore } from "pinia";
-import NDK, {
-  NDKEvent,
-  NDKNip07Signer,
-  NDKNip46Signer,
-  NDKFilter,
-  NDKPrivateKeySigner,
-  NDKKind,
-  NDKSubscription,
-} from "@nostr-dev-kit/ndk";
+import { markRaw } from "vue";
+import type { NostrEvent, RuntimeSubscription } from "nostr-pubsub";
+import { nostrRuntime, publishEvent } from "src/js/nostrRuntime";
+import { privateSigner } from "src/js/nostrSigner";
 import { useLocalStorage } from "@vueuse/core";
 import { bytesToHex } from "@noble/hashes/utils"; // already an installed dependency
 import { nip04, generateSecretKey, getPublicKey } from "nostr-tools";
@@ -84,8 +79,7 @@ export const useNWCStore = defineStore("nwc", {
       useSettingsStore().defaultNostrRelays
     ),
     blocking: false,
-    ndk: new NDK(),
-    subscriptions: [] as NDKSubscription[],
+    subscriptions: [] as RuntimeSubscription[],
     showNWCDialog: false,
     showNWCData: { connection: {} as NWCConnection, connectionString: "" },
   }),
@@ -332,30 +326,29 @@ export const useNWCStore = defineStore("nwc", {
     // ––––---------- NWC Connection ––––----------
     replyNWC: async function (
       result: NWCResult | NWCError,
-      event: NDKEvent,
+      event: NostrEvent,
       conn: NWCConnection
     ) {
-      // reply to NWC with result
-      let replyEvent = new NDKEvent(event.ndk);
-      replyEvent.kind = 23195;
-      console.log("### replying with", JSON.stringify(result));
-      replyEvent.content = await nip04.encrypt(
-        conn.walletPrivateKey,
-        event.author.pubkey,
-        JSON.stringify(result)
+      await publishEvent(
+        await privateSigner(conn.walletPrivateKey).signEvent({
+          kind: NWCKind.NWCResponse,
+          created_at: Math.floor(Date.now() / 1000),
+          content: await nip04.encrypt(
+            conn.walletPrivateKey,
+            event.pubkey,
+            JSON.stringify(result)
+          ),
+          tags: [
+            ["p", event.pubkey],
+            ["e", event.id],
+          ],
+        }),
+        this.relays
       );
-      replyEvent.tags = [
-        ["p", event.author.pubkey],
-        ["e", event.id],
-      ];
-      console.log("### replyEvent", replyEvent);
-      console.log("### replying to", event.id);
-      // await this.ndk.publish(replyEvent);
-      await replyEvent.publish();
     },
     parseNWCCommand: async function (
       command: string,
-      event: NDKEvent,
+      event: NostrEvent,
       conn: NWCConnection
     ) {
       // parse command to JSON object {method: 'pay_invoice', params: {invoice: '1234'}}
@@ -430,98 +423,64 @@ export const useNWCStore = defineStore("nwc", {
         conn = this.connections[0];
       }
 
-      const walletSigner = new NDKPrivateKeySigner(conn.walletPrivateKey);
-      // close and delete all old subscriptions
       this.unsubscribeNWC();
-      this.ndk = new NDK({
-        explicitRelayUrls: this.relays,
-        signer: walletSigner,
-      });
-      this.ndk.connect();
-
-      const nip47InfoEvent = new NDKEvent(this.ndk);
-      nip47InfoEvent.kind = NWCKind.NWCInfo;
-      nip47InfoEvent.content = this.supportedMethods.join(" ");
       try {
-        // let's fetch the info event from the relay to see if we need to republish it
-        // use NWCKind.NWCInfo as an integer here
-        let filterInfoEvent: NDKFilter = {
-          kinds: [NWCKind.NWCInfo],
-          authors: [conn.walletPublicKey],
-        };
-        let eventsInfoEvent = await this.ndk.fetchEvents(filterInfoEvent);
-        if (eventsInfoEvent.size === 0) {
-          await nip47InfoEvent.publish();
-          console.log("### published nip47InfoEvent", nip47InfoEvent);
-        } else {
-          console.log("### nip47InfoEvent already published");
-        }
-      } catch (e) {
-        console.log("### could not publish nip47InfoEvent", nip47InfoEvent);
-        console.log("### error", e);
+        const { events } = await nostrRuntime.query(
+          [{ kinds: [NWCKind.NWCInfo], authors: [conn.walletPublicKey] }],
+          { relays: this.relays }
+        );
+        if (!events.length)
+          await publishEvent(
+            await privateSigner(conn.walletPrivateKey).signEvent({
+              kind: NWCKind.NWCInfo,
+              created_at: Math.floor(Date.now() / 1000),
+              tags: [],
+              content: this.supportedMethods.join(" "),
+            }),
+            this.relays
+          );
+      } catch (error) {
+        console.error("Could not publish wallet connection info", error);
       }
     },
     listenToNWCCommands: async function () {
-      // if (!this.connections.length) {
-      //   await this.generateNWCConnection()
-      // }
       await this.generateNWCConnection();
-      // we only support one connection for now
       const conn = this.connections[0];
-
-      const currentUnitTime = Math.floor(Date.now() / 1000);
-      const subscribeSince = currentUnitTime - 60; // 1 minute
-      let filter = {
-        kinds: [NWCKind.NWCRequest as NDKKind],
-        since: subscribeSince,
-        authors: [conn.connectionPublicKey],
-        "#p": [conn.walletPublicKey],
-      } as NDKFilter;
-      const sub = this.ndk.subscribe(filter);
-      console.log("### subscribing to NWC on relays: ", this.relays);
-      this.subscriptions.push(sub);
-
-      sub.on("eose", () =>
-        console.log("All relays have reached the end of the event stream")
+      const sub = nostrRuntime.subscribe(
+        [
+          {
+            kinds: [NWCKind.NWCRequest],
+            since: Math.floor(Date.now() / 1000) - 60,
+            authors: [conn.connectionPublicKey],
+            "#p": [conn.walletPublicKey],
+          },
+        ],
+        {
+          onEvent: (event) => {
+            if (!this.nwcEnabled || event.created_at <= this.seenCommandsUntil)
+              return;
+            // Keep the existing persisted replay cursor and advance before async work.
+            this.seenCommandsUntil = event.created_at;
+            void (async () => {
+              const content = await nip04.decrypt(
+                conn.connectionSecret,
+                conn.walletPublicKey,
+                event.content
+              );
+              await this.parseNWCCommand(content, event, conn);
+            })().catch((error) =>
+              console.error("Could not process wallet command", error)
+            );
+          },
+        },
+        { relays: this.relays, cache: "network-only", localEcho: false }
       );
-      sub.on("close", () => console.log("Subscription closed"));
-
-      sub.on("event", async (event) => {
-        // console.log("### event", event)
-        // console.log('### event.kind', event.kind)
-        // console.log('### event.id', event.id)
-        // console.log('### event.author.pubkey', event.author.pubkey)
-        // console.log("### event.tagValue('p')", event.tagValue("p"))
-        // console.log("### event.tagValue('e')", event.tagValue("e"))
-        // console.log("### event.content", event.content)
-        if (event.kind != NWCKind.NWCRequest) {
-          return; // ignore non-NWC events
-        }
-        if (!this.nwcEnabled) {
-          console.log("### Received NWC command but NWC is disabled");
-          return;
-        }
-        // check if the events date is after the last seen command
-        if (event.created_at <= this.seenCommandsUntil) {
-          return;
-        }
-        this.seenCommandsUntil = event.created_at;
-
-        console.log("### NWC request!");
-        console.log("### event", event);
-        const decryptedContent = await nip04.decrypt(
-          conn.connectionSecret,
-          conn.walletPublicKey,
-          event.content
-        );
-        // console.log("### decryptedContent", decryptedContent)
-        await this.parseNWCCommand(decryptedContent, event, conn);
-      });
+      this.subscriptions.push(markRaw(sub));
     },
     unsubscribeNWC: function () {
       console.log("### unsubscribing from NWC");
       for (let sub of this.subscriptions) {
-        sub.stop();
+        sub.close();
       }
       this.subscriptions = [];
     },
