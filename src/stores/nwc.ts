@@ -65,7 +65,7 @@ const NWCKind = {
 
 export const useNWCStore = defineStore("nwc", {
   state: () => ({
-    nwcEnabled: useLocalStorage<boolean>("cashu.nwc.enabled", false),
+    nwcEnabled: useLocalStorage<boolean>("cashu.nwc.enabled", true),
     connections: useLocalStorage<NWCConnection[]>("cashu.nwc.connections", []),
     seenCommandsUntil: useLocalStorage<number>(
       "cashu.nwc.seenCommandsUntil",

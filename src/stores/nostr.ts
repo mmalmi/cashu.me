@@ -63,7 +63,9 @@ export const useNostrStore = defineStore("nostr", {
     ndk: {} as NDK,
     signerType: useLocalStorage<SignerType>(
       "cashu.ndk.signerType",
-      SignerType.SEED
+      localStorage.getItem("cashu.ndk.privateKeySignerPrivateKey")
+        ? SignerType.PRIVATEKEY
+        : SignerType.NIP07
     ),
     nip07signer: {} as NDKNip07Signer,
     nip46Token: useLocalStorage<string>("cashu.ndk.nip46Token", ""),

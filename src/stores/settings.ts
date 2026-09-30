@@ -4,6 +4,7 @@ import { useLocalStorage } from "@vueuse/core";
 const defaultNostrRelays = [
   "wss://relay.damus.io",
   "wss://relay.8333.space/",
+  "wss://temp.iris.to/",
   "wss://nos.lol",
 ];
 
@@ -12,7 +13,7 @@ export const useSettingsStore = defineStore("settings", {
     return {
       getBitcoinPrice: useLocalStorage<boolean>(
         "cashu.settings.getBitcoinPrice",
-        false
+        true
       ),
       checkSentTokens: useLocalStorage<boolean>(
         "cashu.settings.checkSentTokens",
